@@ -14,12 +14,15 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from . import database as db
+from . import events
 from . import lineage
 from .schemas import (
     BatchRecord,
     BatchResponse,
     BatchSubmission,
     HealthResponse,
+    MosaicEvent,
+    MosaicEventPage,
     ProductStatus,
     RevisionHistoryItem,
     RevisionHistoryResponse,
@@ -62,7 +65,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         title="影像谱系 API",
         description=(
             "分批提交原始瓦片与拼图清单，追踪多级固定父引用，"
-            "查询现役拼图的可交付状态及受阻引用路径（父项缺失 / 父项已非现役 / 循环引用）。"
+            "查询现役拼图的可交付状态及受阻引用路径（父项缺失 / 父项已非现役 / 循环引用）；"
+            "并通过 /api/mosaic-events 按游标分页领取拼图状态变更事件，供下游刷新缓存。"
         ),
         version="1.0.0",
         lifespan=lifespan,
@@ -172,6 +176,31 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                 if deliverable is None or status["deliverable"] is deliverable:
                     results.append(ProductStatus(**status))
         return results
+
+    # ---------------- 拼图状态变更事件 ----------------
+    @app.get(
+        "/api/mosaic-events",
+        response_model=MosaicEventPage,
+        tags=["状态变更事件"],
+        summary="按游标分页领取拼图状态变更事件（断线/重启后可从原游标续领）",
+    )
+    def mosaic_events(
+        cursor: int = Query(
+            default=0, ge=0,
+            description="已领取的最大事件号；0 表示从头领取。响应的 next_cursor 用于下次续领",
+        ),
+        limit: int = Query(default=100, ge=1, le=1000, description="每页最大事件数"),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> MosaicEventPage:
+        # 单快照内读取一页：事件只追加且 event_id 单调，严格大于游标 + 升序
+        # 翻页，并发提交与翻页不会漏领或重领。
+        with db.snapshot(conn):
+            rows, has_more = events.list_events(conn, cursor, limit)
+        page = [MosaicEvent(**events.row_to_event_dict(r)) for r in rows]
+        next_cursor = page[-1].event_id if page else cursor
+        return MosaicEventPage(
+            events=page, next_cursor=next_cursor, has_more=has_more
+        )
 
     # ---------------- 修订追溯 ----------------
     @app.get(

@@ -20,6 +20,14 @@
 - **并发安全**：写事务 `BEGIN IMMEDIATE` 串行化；每次查询在单个 SQLite 快照事务内
   完成全部读取，不会混用某次并发提交前后的谱系状态。
 - **审计**：所有批次（含拒收/重复）写入 `batches` 表，可通过 `/api/batches` 追溯。
+- **状态变更事件**：每批提交前后比较受影响的现役拼图（含被上游波及的下游拼图），
+  将新出现或结论、阻断路径发生净变化的拼图连同当时状态记为持久事件，
+  供下游缓存按游标增量领取：
+  - 事件与清单**同一事务**提交，失败不留部分事件或修订；冲突拒收、完全重传零事件；
+  - 同批对同一拼图的多项修改只记最终结果（每拼图每批至多一条）；
+  - 事件落库后不改写（`blockers` 为当时快照），历史事件不随最新谱系变化；
+  - 游标即事件号（单调递增、重启不回退），断线/重启后从 `next_cursor` 续领，
+    并发提交与翻页不漏领、不重领。
 
 ## 目录结构
 
@@ -29,8 +37,10 @@ app/
   schemas.py    Pydantic 请求/响应模型（中文 Schema 说明）
   database.py   SQLite 连接、显式事务、整批原子提交
   lineage.py    谱系评估（缺失/退役/环检测与引用路径）
+  events.py     拼图状态变更事件：受影响集合计算、前后比较、游标分页
 tests/
-  test_api.py   18 个端到端关键情形自测
+  test_api.py     谱系与批次关键情形自测（19 个）
+  test_events.py  状态变更事件关键情形自测（15 个）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -78,6 +88,7 @@ pytest -q
 | GET | `/api/products/{id}/status` | 现役（或 `?revision=N` 指定）修订的可交付状态与阻断路径 |
 | GET | `/api/mosaics` | 全部现役拼图，支持 `?deliverable=true/false` 过滤 |
 | GET | `/api/products/{id}/revisions` | 成果修订历史与现役标记 |
+| GET | `/api/mosaic-events` | 按游标分页领取拼图状态变更事件（`?cursor=&limit=`） |
 
 ## 快速示例
 
@@ -98,9 +109,29 @@ curl localhost:8000/api/products/M-100/status
 
 阻断路径元素形如 `M-100@1`、`R-1@1`，从被查询成果逐级上行，末位即问题节点。
 
+## 下游缓存增量刷新（状态变更事件）
+
+```bash
+# 首次从游标 0 领取；之后每次用上一页的 next_cursor 续领
+curl 'localhost:8000/api/mosaic-events?cursor=0&limit=100'
+# → {"events":[{"event_id":1,"product_id":"M-100","revision":1,
+#               "event_type":"appeared","deliverable":false,"blockers":[...],...}],
+#     "next_cursor":1,"has_more":false}
+
+# 客户端持久化 next_cursor；断线/重启后从原游标续领，只拿到新事件
+curl 'localhost:8000/api/mosaic-events?cursor=1&limit=100'
+```
+
+- `event_type`：`appeared`（新出现的现役拼图）/ `changed`（结论或阻断路径净变化）。
+- 事件携带**当时**的 `deliverable` 与 `blockers` 快照，落库后不改写；
+  当前结论仍以 `GET /api/products/{id}/status` 为准。
+- 本页为空时 `next_cursor` 保持原值、`has_more=false`，可原地轮询等待新事件。
+
 ## 数据模型要点
 
 - `revisions` 表以 `(product_id, revision)` 为主键，父引用为固定的
   `(parent_product_id, parent_revision)`；每条修订不可变（冲突即整批拒收）。
 - `batches` 记录每次提交的状态、条目数、实际写入数与时间。
+- `mosaic_events` 记录拼图状态变更事件（只插不改）：`event_id` 自增即游标，
+  关联批次号，含当时现役修订、结论与阻断路径 JSON 快照；与批次同事务写入。
 - WAL 模式 + `busy_timeout=30s`，支持读写并发、写事务排队串行化。

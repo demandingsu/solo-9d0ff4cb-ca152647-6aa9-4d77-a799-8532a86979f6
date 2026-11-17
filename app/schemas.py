@@ -133,6 +133,33 @@ class BatchRecord(BaseModel):
     submitted_at: str
 
 
+class MosaicEvent(BaseModel):
+    """一条拼图状态变更事件：记录当时状态快照，落库后不再改写。"""
+
+    event_id: int = Field(..., description="事件号，单调递增且重启不回退，即续领游标")
+    batch_id: int = Field(..., description="产生该事件的批次号")
+    product_id: str = Field(..., description="状态发生变化的拼图成果号")
+    revision: int = Field(..., description="事件发生时该拼图的现役修订号")
+    event_type: Literal["appeared", "changed"] = Field(
+        ..., description="appeared=新出现的现役拼图；changed=结论或阻断路径净变化"
+    )
+    deliverable: bool = Field(..., description="事件发生当时的可交付结论")
+    blockers: list[Blocker] = Field(
+        default_factory=list, description="事件发生当时的阻断路径快照（可交付时为空）"
+    )
+    occurred_at: str = Field(..., description="事件所属批次的提交时间（UTC）")
+
+
+class MosaicEventPage(BaseModel):
+    """按游标分页领取的事件页。"""
+
+    events: list[MosaicEvent] = Field(default_factory=list)
+    next_cursor: int = Field(
+        ..., description="下次领取使用的游标（本页最大事件号；本页为空时保持原游标）"
+    )
+    has_more: bool = Field(..., description="是否还有未领取的事件")
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     database: str

@@ -356,7 +356,10 @@ def test_concurrent_conflicting_writes_serialize():
     assert sorted(o[1] for o in outcomes) == ["accepted", "rejected"]
     with TestClient(app) as c:
         surviving = c.get("/api/products/X/status").json()
-        assert surviving["summary"] == "摘要A"
+        # 两个线程竞态，先提交者胜出（A 或 B 均可）；
+        # 关键是串行化生效：唯一被接受的内容与库中存活数据自洽
+        accepted_summary = next(o[0] for o in outcomes if o[1] == "accepted")
+        assert surviving["summary"] == accepted_summary
         statuses = [b["status"] for b in c.get("/api/batches").json()]
         assert sorted(statuses) == ["accepted", "rejected"]
     for suffix in ("", "-wal", "-shm"):

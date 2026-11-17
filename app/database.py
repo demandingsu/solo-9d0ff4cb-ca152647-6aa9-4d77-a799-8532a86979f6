@@ -47,6 +47,22 @@ CREATE TABLE IF NOT EXISTS revisions (
 
 CREATE INDEX IF NOT EXISTS idx_revisions_parent
     ON revisions(parent_product_id, parent_revision);
+
+-- 拼图状态变更事件：与批次同事务写入，落库后不改写；
+-- event_id 单调递增（AUTOINCREMENT 不回退），即下游续领游标。
+CREATE TABLE IF NOT EXISTS mosaic_events (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      INTEGER NOT NULL REFERENCES batches(batch_id),
+    product_id    TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    event_type    TEXT NOT NULL CHECK (event_type IN ('appeared', 'changed')),
+    deliverable   INTEGER NOT NULL CHECK (deliverable IN (0, 1)),
+    blockers      TEXT NOT NULL,
+    occurred_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mosaic_events_product
+    ON mosaic_events(product_id);
 """
 
 
@@ -258,7 +274,17 @@ def submit_batch(conn: sqlite3.Connection, items: list[dict[str, Any]]) -> dict[
                 "message": "清单与已提交内容完全一致，按重复提交处理（幂等）",
             }
 
-        # 3) 写入新条目 + accepted 批次记录，同一事务原子提交
+        # 3) 写入新条目 + accepted 批次记录 + 拼图状态变更事件，同一事务原子提交。
+        #    事件在库内生成：先算受影响拼图并留批前快照，写入修订后逐一比较，
+        #    净变化落库；任一步失败整体回滚，不留部分事件或部分修订。
+        from . import events  # 延迟导入，避免与 events 模块循环依赖
+
+        new_items = [
+            item for key, item in deduped.items() if key not in identical_existing
+        ]
+        affected = events.collect_affected_product_ids(conn, new_items)
+        before_states = events.snapshot_states(conn, affected)
+
         batch_id = _insert_batch_record(
             conn, "accepted", item_count,
             len(deduped) - len(identical_existing), None,
@@ -276,6 +302,7 @@ def submit_batch(conn: sqlite3.Connection, items: list[dict[str, Any]]) -> dict[
                     batch_id, now,
                 ),
             )
+        events.record_events(conn, batch_id, affected, before_states, now)
         conn.execute("COMMIT")
         return {
             "batch_id": batch_id,
